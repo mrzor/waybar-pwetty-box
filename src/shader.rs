@@ -177,6 +177,9 @@ pub struct ShaderPass {
     program: glow::Program,
     vao: glow::VertexArray,
     target: Option<(glow::Framebuffer, glow::Texture, i32, i32)>,
+    /// One-shot log guard: target creation failure is reported once per pass,
+    /// not per frame (the draw path runs at ~30fps).
+    target_error_logged: bool,
 }
 
 impl ShaderPass {
@@ -203,6 +206,7 @@ impl ShaderPass {
                 program,
                 vao,
                 target: None,
+                target_error_logged: false,
             })
         }
     }
@@ -210,7 +214,10 @@ impl ShaderPass {
     /// Render one frame at `w`×`h` device pixels and read it back as RGBA8,
     /// top-left origin (ready for [`crate::paint_rgba`]). `uniforms` are extra
     /// `float` uniforms (resolved from data) set by name; unknown names are
-    /// ignored.
+    /// ignored. If the render target can't be (re)created (context loss, GL
+    /// object exhaustion), returns the zeroed (fully transparent) buffer so the
+    /// caller composites nothing for this frame instead of panicking inside a
+    /// GTK draw handler.
     pub fn render(
         &mut self,
         w: i32,
@@ -220,10 +227,21 @@ impl ShaderPass {
         uniforms: &[(String, f32)],
     ) -> Vec<u8> {
         let mut buf = vec![0u8; (w.max(1) * h.max(1) * 4) as usize];
-        unsafe { self.ensure_target(w, h) };
+        if !unsafe { self.ensure_target(w, h) } {
+            if !self.target_error_logged {
+                self.target_error_logged = true;
+                eprintln!(
+                    "pwetty-box: shader render-target creation failed (GL texture/framebuffer); \
+                     skipping shader layer"
+                );
+            }
+            return buf;
+        }
         let gl = &self.gl;
         unsafe {
-            let (fbo, ..) = self.target.unwrap();
+            let Some((fbo, ..)) = self.target else {
+                return buf;
+            };
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.viewport(0, 0, w, h);
             // Deterministic state: another renderer (femtovg) may have left
@@ -264,17 +282,21 @@ impl ShaderPass {
         buf
     }
 
-    /// (Re)create the color texture + FBO when the size changes.
-    unsafe fn ensure_target(&mut self, w: i32, h: i32) {
+    /// (Re)create the color texture + FBO when the size changes. Returns
+    /// `false` (with `self.target` left empty) if GL object creation fails —
+    /// the caller degrades to a transparent frame rather than panicking.
+    unsafe fn ensure_target(&mut self, w: i32, h: i32) -> bool {
         if self.target.map(|(_, _, tw, th)| (tw, th)) == Some((w, h)) {
-            return;
+            return true;
         }
         let gl = &self.gl;
         if let Some((fbo, tex, _, _)) = self.target.take() {
             gl.delete_framebuffer(fbo);
             gl.delete_texture(tex);
         }
-        let tex = gl.create_texture().unwrap();
+        let Ok(tex) = gl.create_texture() else {
+            return false;
+        };
         gl.bind_texture(glow::TEXTURE_2D, Some(tex));
         gl.tex_image_2d(
             glow::TEXTURE_2D,
@@ -297,7 +319,10 @@ impl ShaderPass {
             glow::TEXTURE_MAG_FILTER,
             glow::LINEAR as i32,
         );
-        let fbo = gl.create_framebuffer().unwrap();
+        let Ok(fbo) = gl.create_framebuffer() else {
+            gl.delete_texture(tex);
+            return false;
+        };
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
         gl.framebuffer_texture_2d(
             glow::FRAMEBUFFER,
@@ -307,6 +332,7 @@ impl ShaderPass {
             0,
         );
         self.target = Some((fbo, tex, w, h));
+        true
     }
 }
 
