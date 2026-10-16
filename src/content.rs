@@ -145,9 +145,9 @@ impl ContentStore {
         self.inner.shutdown.store(true, Ordering::Release);
         let pid = self.inner.child_pid.load(Ordering::Acquire);
         if pid != 0 {
-            // ponytail: zero-dependency SIGTERM via the `kill` binary rather
-            // than adding a libc/nix dep (neither is a direct dependency
-            // today) just to call kill(2) directly.
+            // SIGTERM via the `kill` binary rather than adding a libc/nix
+            // dependency (neither is a direct dependency today) just to call
+            // kill(2) directly.
             let _ = std::process::Command::new("kill")
                 .arg(pid.to_string())
                 .status();
@@ -265,10 +265,10 @@ pub fn from_config(config: &Config) -> Option<ContentStore> {
                 if publish.is_shutdown() {
                     break;
                 }
-                // ponytail: a hung command blocks this thread inside
+                // Known limit: a hung command blocks this thread inside
                 // `Command::output()` with no timeout — shutdown only stops
-                // the *next* iteration, not one already in flight. Accepted
-                // ceiling; add a kill-on-timeout if a hung poll command bites.
+                // the *next* iteration, not one already in flight. Add a
+                // kill-on-timeout if a hung poll command bites.
                 let data = parse_data(&run_command(&exec));
                 publish.set(build.content(&data));
                 if interval == 0 {
