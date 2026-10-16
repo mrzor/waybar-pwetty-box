@@ -25,7 +25,7 @@ pub mod text;
 pub mod tile;
 pub mod tiles;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
@@ -111,6 +111,78 @@ pub struct PwettyBox {
     _shared: Rc<Shared>,
 }
 
+/// Hover highlight: fade duration (ms), ring colour (light grey with a slight
+/// blue cast), and peak stroke alpha.
+const HOVER_FADE_MS: f64 = 160.0;
+const HOVER_COLOR: &str = "#b9c1d9";
+const HOVER_ALPHA: f64 = 0.6;
+/// Peak content zoom on hover — the tile's text (a desktop's shortcut number,
+/// say) swells a touch and settles back on leave. Discreet on purpose: past
+/// ~1.08 a wide tile's content starts hitting the widget's clip edge.
+const HOVER_SCALE: f64 = 1.06;
+
+/// Pointer-hover fade state. A flip records the alpha it started from, so a
+/// mid-fade reversal animates smoothly instead of jumping.
+struct Hover {
+    inside: Cell<bool>,
+    flipped: Cell<Instant>,
+    from_alpha: Cell<f64>,
+}
+
+impl Hover {
+    fn new() -> Self {
+        Self {
+            inside: Cell::new(false),
+            flipped: Cell::new(Instant::now()),
+            from_alpha: Cell::new(0.0),
+        }
+    }
+
+    /// Flip the hover state (no-op if unchanged), restarting the fade from the
+    /// current alpha.
+    fn set(&self, inside: bool) {
+        if self.inside.get() == inside {
+            return;
+        }
+        self.from_alpha.set(self.alpha());
+        self.inside.set(inside);
+        self.flipped.set(Instant::now());
+    }
+
+    /// Current ring alpha in `[0, 1]`, interpolating toward the state's target.
+    fn alpha(&self) -> f64 {
+        let p = (self.flipped.get().elapsed().as_secs_f64() * 1000.0 / HOVER_FADE_MS).min(1.0);
+        let target = if self.inside.get() { 1.0 } else { 0.0 };
+        self.from_alpha.get() + (target - self.from_alpha.get()) * p
+    }
+
+    /// Content zoom factor, tracking the same fade as [`Hover::alpha`] so the
+    /// ring and the scale move together (and reverse together mid-fade).
+    fn scale(&self) -> f64 {
+        1.0 + self.alpha() * (HOVER_SCALE - 1.0)
+    }
+
+    /// True while a fade is still in progress.
+    fn animating(&self) -> bool {
+        self.flipped.get().elapsed().as_secs_f64() * 1000.0 < HOVER_FADE_MS
+    }
+}
+
+/// Redraw `area` at ~30fps until `hover`'s fade completes. Each flip spawns one;
+/// a stale timer self-terminates after one extra tick.
+fn animate_hover(area: &gtk::DrawingArea, hover: &Rc<Hover>) {
+    let area = area.clone();
+    let hover = hover.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(33), move || {
+        area.queue_draw();
+        if hover.animating() {
+            gtk::glib::ControlFlow::Continue
+        } else {
+            gtk::glib::ControlFlow::Break
+        }
+    });
+}
+
 impl Module for PwettyBox {
     // Take the raw JSON so we can layer a bundled tile preset (`"tile": "..."`)
     // under it before deserializing into the typed `Config`.
@@ -124,6 +196,29 @@ impl Module for PwettyBox {
         area.set_size_request(config.width, config.height);
         area.set_hexpand(false);
         area.set_vexpand(false);
+
+        // Pointer-hover highlight: a thin grey-blue ring fading in/out (see
+        // `Hover`). Enter/leave must be in the event mask before realize.
+        area.add_events(
+            gtk::gdk::EventMask::ENTER_NOTIFY_MASK | gtk::gdk::EventMask::LEAVE_NOTIFY_MASK,
+        );
+        let hover = Rc::new(Hover::new());
+        {
+            let hover = hover.clone();
+            area.connect_enter_notify_event(move |area, _| {
+                hover.set(true);
+                animate_hover(area, &hover);
+                glib_propagation_proceed()
+            });
+        }
+        {
+            let hover = hover.clone();
+            area.connect_leave_notify_event(move |area, _| {
+                hover.set(false);
+                animate_hover(area, &hover);
+                glib_propagation_proceed()
+            });
+        }
 
         // Content source (static text / refreshing command), if configured.
         let content = content::from_config(&config);
@@ -149,6 +244,7 @@ impl Module for PwettyBox {
         {
             let shared = shared.clone();
             let content_draw = content.clone();
+            let hover = hover.clone();
             area.connect_draw(move |area, cr| {
                 let scale = area.scale_factor().max(1);
                 // Shader uniforms resolved from the current data (empty if none).
@@ -230,6 +326,18 @@ impl Module for PwettyBox {
                                 frame,
                                 scale: scale as f64,
                             };
+                            // Hover zoom: swell the content about the tile centre
+                            // (background/ring stay put) so the number grows in
+                            // place and settles back on leave. The hover timer
+                            // queues whole-widget redraws while it fades, so the
+                            // static layer's damage rects are never trusted mid-zoom.
+                            let hs = hover.scale();
+                            let _ = cr.save();
+                            if hs > 1.0 {
+                                cr.translate(wl / 2.0, hl / 2.0);
+                                cr.scale(hs, hs);
+                                cr.translate(-wl / 2.0, -hl / 2.0);
+                            }
                             draw_content_cached(
                                 cr,
                                 markup,
@@ -239,8 +347,22 @@ impl Module for PwettyBox {
                                 Some(&mut fx),
                                 &mut shared.layer.borrow_mut(),
                             );
+                            let _ = cr.restore();
                         }
                     }
+                }
+
+                // Hover highlight: a thin ring on the focus bubble, fading
+                // in/out with pointer hover. Drawn last, over the content.
+                let a = hover.alpha();
+                if a > 0.01 {
+                    let wl = area.allocated_width().max(1) as f64;
+                    let hl = area.allocated_height().max(1) as f64;
+                    let (x, y, pw, ph, r) = focus_bubble(wl, hl);
+                    rounded_rect(cr, x, y, pw, ph, r);
+                    set_hex(cr, HOVER_COLOR, a * HOVER_ALPHA);
+                    cr.set_line_width(1.0);
+                    let _ = cr.stroke();
                 }
 
                 glib_propagation_proceed()
@@ -1929,6 +2051,26 @@ waybar_module!(PwettyBox);
 mod tests {
     use super::*;
     const P: char = markup::EMBED_PLACEHOLDER;
+
+    #[test]
+    fn hover_fades_between_states() {
+        let wait = std::time::Duration::from_millis(HOVER_FADE_MS as u64 + 50);
+        let h = Hover::new();
+        assert_eq!(h.alpha(), 0.0);
+        h.set(true);
+        assert!(h.alpha() <= 1.0);
+        std::thread::sleep(wait);
+        assert_eq!(h.alpha(), 1.0);
+        assert!(!h.animating());
+        h.set(false);
+        std::thread::sleep(wait);
+        assert_eq!(h.alpha(), 0.0);
+        // Content zoom rides the same fade: rest at 1.0, peak at HOVER_SCALE.
+        assert_eq!(h.scale(), 1.0);
+        h.set(true);
+        std::thread::sleep(wait);
+        assert_eq!(h.scale(), HOVER_SCALE);
+    }
 
     #[test]
     fn flow_layout_single_line_with_embed() {
