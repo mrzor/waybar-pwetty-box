@@ -68,6 +68,28 @@ struct Engine {
     frame: i32,
 }
 
+/// Teardown happens with no guarantee of a current GL context: GTK disposes the
+/// widget on output removal / config reload and drops the draw closure's
+/// `Rc<Shared>` whenever it likes, and anything else on the thread may have
+/// bound a different context since our last frame. femtovg's `OpenGl::drop`
+/// then issues `glDeleteVertexArrays` and epoxy aborts the whole bar
+/// ("Couldn't find current GLX or EGL context" — observed as a SIGABRT on
+/// laptop-lid close disconnecting eDP-1). Make the shared context current for
+/// the drop; if that fails, leak the canvas — its GL objects die with the
+/// context anyway.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let Some(renderer) = self.renderer.take() else {
+            return;
+        };
+        if shared_gl_current() {
+            drop(renderer);
+        } else {
+            std::mem::forget(renderer);
+        }
+    }
+}
+
 impl Engine {
     /// Compile the background shader (or recompile if the file changed). A GL
     /// context must be current. Compile errors are logged and leave no shader.
@@ -1928,6 +1950,34 @@ waybar_module!(PwettyBox);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: dropping an engine that owns a femtovg canvas with no GL
+    /// context current must not abort (epoxy asserts inside femtovg's
+    /// `OpenGl::drop` otherwise). This is what happens live when an output is
+    /// removed or the config reloads: GTK disposes the widget and the draw
+    /// closure drops the last `Rc<Shared>` long after any context was current.
+    #[test]
+    fn engine_drop_without_current_context() {
+        if !shared_gl_current() {
+            eprintln!("skipping: no surfaceless EGL in this environment");
+            return;
+        }
+        let config = config::resolve(serde_json::json!({}));
+        let renderer = Renderer::new(&config, true).expect("renderer");
+        let engine = Engine {
+            renderer: Some(renderer),
+            start: Instant::now(),
+            shader_path: None,
+            shader: None,
+            shader_mtime: None,
+            span_shaders: shader::ShaderCache::new(),
+            frame: 0,
+        };
+        // A second context's Drop unbinds the thread's current context — the
+        // engine teardown that follows must cope with "nothing current".
+        drop(OffscreenGl::new().expect("second EGL context"));
+        drop(engine); // aborts the whole test process if the fix regresses
+    }
     const P: char = markup::EMBED_PLACEHOLDER;
 
     #[test]
