@@ -12,8 +12,8 @@
 //! widget polls the dirty flag and redraws when it flips.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{BufRead, BufReader, Read};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -45,6 +45,15 @@ struct Inner {
     /// static tile (idle/empty/plain wrapped text) is `false` and only repaints
     /// on a content change (the dirty flag), keeping the bar cool.
     animating: AtomicBool,
+    /// Set once by [`ContentStore::shutdown`] (module teardown, e.g. a waybar
+    /// reload). The poll/stream background loops and the dirty-poll timer
+    /// check this each iteration and stop instead of running for the rest of
+    /// the process.
+    shutdown: AtomicBool,
+    /// Pid of the currently-running stream child, 0 if none. Lets `shutdown`
+    /// kill a live producer from another thread so a reader blocked on its
+    /// stdout unblocks via EOF instead of leaking forever.
+    child_pid: AtomicU32,
 }
 
 /// Whether rendered tile `markup` contains a continuously-animated element.
@@ -76,6 +85,8 @@ impl ContentStore {
                 content: Mutex::new(initial),
                 dirty: AtomicBool::new(true),
                 animating: AtomicBool::new(animating),
+                shutdown: AtomicBool::new(false),
+                child_pid: AtomicU32::new(0),
             }),
         }
     }
@@ -117,6 +128,50 @@ impl ContentStore {
     /// Clear and return the dirty flag — true if content changed since last call.
     pub fn take_dirty(&self) -> bool {
         self.inner.dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// True once [`shutdown`](Self::shutdown) has been called. Checked by the
+    /// poll/stream background loops and the dirty-poll timer.
+    pub fn is_shutdown(&self) -> bool {
+        self.inner.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Tear down: stop the poll/stream loop (they check
+    /// [`is_shutdown`](Self::is_shutdown)) and kill the current stream child,
+    /// if any, so a reader thread blocked on its stdout unblocks via EOF
+    /// instead of leaking a thread + producer chain forever. Call once, from
+    /// module teardown (e.g. `PwettyBox`'s `Drop`).
+    pub fn shutdown(&self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        let pid = self.inner.child_pid.load(Ordering::Acquire);
+        if pid != 0 {
+            // ponytail: zero-dependency SIGTERM via the `kill` binary rather
+            // than adding a libc/nix dep (neither is a direct dependency
+            // today) just to call kill(2) directly.
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status();
+        }
+    }
+
+    /// Record the pid of the stream child currently being read, for
+    /// [`shutdown`](Self::shutdown) to kill from another thread.
+    fn set_child_pid(&self, pid: u32) {
+        self.inner.child_pid.store(pid, Ordering::Release);
+    }
+
+    /// Clear the recorded child pid once it's no longer live.
+    fn clear_child_pid(&self) {
+        self.inner.child_pid.store(0, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl ContentStore {
+    /// Test-only: the currently-recorded stream child pid (0 = none) — used
+    /// to observe that the respawn loop stopped after `shutdown()`.
+    pub(crate) fn child_pid(&self) -> u32 {
+        self.inner.child_pid.load(Ordering::Acquire)
     }
 }
 
@@ -204,8 +259,16 @@ pub fn from_config(config: &Config) -> Option<ContentStore> {
         } else {
             // Poll mode: re-run on the interval (0 = run once).
             let interval = config.interval;
-            // Detached: lives for the process (waybar modules are process-lifetime).
+            // Runs until `publish.shutdown()` is called (module teardown,
+            // e.g. a waybar reload).
             thread::spawn(move || loop {
+                if publish.is_shutdown() {
+                    break;
+                }
+                // ponytail: a hung command blocks this thread inside
+                // `Command::output()` with no timeout — shutdown only stops
+                // the *next* iteration, not one already in flight. Accepted
+                // ceiling; add a kill-on-timeout if a hung poll command bites.
                 let data = parse_data(&run_command(&exec));
                 publish.set(build.content(&data));
                 if interval == 0 {
@@ -248,16 +311,26 @@ impl ContentBuilder {
 }
 
 /// Streaming `exec`: spawn `cmd` **once** and apply each newline-delimited stdout
-/// line as new content (push), instead of polling on an interval. On EOF/exit we
-/// keep the last content and respawn after [`RESPAWN_BACKOFF`] — so a producer
-/// crash recovers, and a command that exits immediately can't busy-loop. Blank
-/// lines are skipped; a non-JSON line is treated as a plain string value (same as
-/// the poll path), so it never blanks the tile.
+/// line as new content (push), instead of polling on an interval. On EOF/exit —
+/// or on a decode error / an over-cap line — we keep the last content and
+/// respawn after [`RESPAWN_BACKOFF`], so a producer crash *or* a framing
+/// violation recovers, and a command that exits immediately can't busy-loop.
+/// Blank lines are skipped; a non-JSON line is treated as a plain string value
+/// (same as the poll path), so it never blanks the tile. Runs until
+/// `publish.shutdown()` is called (module teardown, e.g. a waybar reload).
 fn spawn_stream(cmd: String, publish: ContentStore, build: ContentBuilder) {
     /// Minimum delay before respawning an exited streaming command.
     const RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
-    // Detached: lives for the process (waybar modules are process-lifetime).
+    /// Cap on a single stream line: a
+    /// producer that never emits `\n` must not grow host memory unboundedly.
+    /// ~120x the realistic tile-watch line (~550B); generous for real content,
+    /// small enough to bound a runaway/hostile producer.
+    const LINE_CAP: u64 = 64 * 1024;
+
     thread::spawn(move || loop {
+        if publish.is_shutdown() {
+            break;
+        }
         match std::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
@@ -266,18 +339,50 @@ fn spawn_stream(cmd: String, publish: ContentStore, build: ContentBuilder) {
             .spawn()
         {
             Ok(mut child) => {
+                publish.set_child_pid(child.id());
                 if let Some(out) = child.stdout.take() {
-                    for line in BufReader::new(out).lines() {
-                        let Ok(line) = line else { break };
-                        if line.trim().is_empty() {
-                            continue;
+                    let mut reader = BufReader::new(out);
+                    let mut buf = Vec::new();
+                    loop {
+                        buf.clear();
+                        let n = match (&mut reader).take(LINE_CAP).read_until(b'\n', &mut buf) {
+                            Ok(n) => n,
+                            Err(_) => break, // I/O error: same recovery as a decode error
+                        };
+                        if n == 0 {
+                            break; // EOF
                         }
-                        publish.set(build.content(&parse_data(&line)));
+                        let terminated = buf.last() == Some(&b'\n');
+                        if !terminated && buf.len() as u64 >= LINE_CAP {
+                            // Over-cap line, not newline-terminated within the
+                            // cap: bail like a decode error rather than
+                            // growing the buffer further.
+                            break;
+                        }
+                        let Ok(text) = std::str::from_utf8(&buf) else {
+                            break; // invalid UTF-8: same recovery as an over-cap line
+                        };
+                        let line = text.trim_end_matches(['\n', '\r']);
+                        if !line.trim().is_empty() {
+                            publish.set(build.content(&parse_data(line)));
+                        }
+                        if publish.is_shutdown() {
+                            break;
+                        }
                     }
                 }
+                // Kill before waiting: an EOF exit is already dying/dead (kill
+                // is then a harmless no-op), but a decode-error/over-cap break
+                // leaves a live, possibly-quiet child that would otherwise
+                // gate `wait()` on its own next write.
+                let _ = child.kill();
                 let _ = child.wait();
+                publish.clear_child_pid();
             }
             Err(e) => eprintln!("pwetty-box: cannot spawn stream exec '{cmd}': {e}"),
+        }
+        if publish.is_shutdown() {
+            break;
         }
         // EOF / exit / spawn failure: keep last content, back off, respawn.
         thread::sleep(RESPAWN_BACKOFF);
@@ -395,5 +500,123 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(store.markup(), "two", "stream applied the latest line");
+    }
+
+    #[test]
+    fn shutdown_stops_respawn_loop() {
+        use crate::config::Config;
+        use std::time::{Duration, Instant};
+        // A short-lived producer, so the respawn loop cycles quickly.
+        let store = super::from_config(&Config {
+            exec: Some("printf 'x\\n'; sleep 0.05".into()),
+            stream: true,
+            format: Some("{{ value }}".into()),
+            font_size: 14.0,
+            ..Default::default()
+        })
+        .expect("exec source yields a store");
+
+        // Confirm the chain is actually running before tearing it down.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store.child_pid() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            store.child_pid(),
+            0,
+            "producer chain running before shutdown"
+        );
+
+        store.shutdown();
+
+        // Let any in-flight iteration see the flag and unwind (kill + wait).
+        std::thread::sleep(Duration::from_millis(200));
+        // RESPAWN_BACKOFF is 1s; poll well past it and confirm the pid never
+        // comes back — a respawn would flip it nonzero again.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            assert_eq!(store.child_pid(), 0, "respawned after shutdown");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn stream_recovers_after_invalid_utf8_line() {
+        use crate::config::Config;
+        use std::time::{Duration, Instant};
+        // First invocation emits one invalid-UTF-8 line then goes quiet
+        // forever (sleep) — at HEAD this wedges the reader in `child.wait()`
+        // with no respawn, since the child never writes again. The fix kills
+        // the child on the decode-error path instead, so the respawn loop
+        // spawns a second invocation; the marker file makes that one emit
+        // valid content instead of repeating the bad line, so recovery is
+        // directly observable. (dash's builtin `printf` has no `\xHH`
+        // escape — `\377` is the portable octal form for a raw 0xFF byte.)
+        let marker =
+            std::env::temp_dir().join(format!("pwetty-box-decode-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker); // clear a stale marker, if any
+        let cmd = format!(
+            "if [ -f {m} ]; then printf '{{\"value\":\"recovered\"}}\\n'; sleep 30; \
+             else touch {m}; printf '\\377\\377\\n'; sleep 30; fi",
+            m = marker.display()
+        );
+        let store = super::from_config(&Config {
+            exec: Some(cmd),
+            stream: true,
+            format: Some("{{ value }}".into()),
+            font_size: 14.0,
+            ..Default::default()
+        })
+        .expect("exec source yields a store");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.markup() != "recovered" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            store.markup(),
+            "recovered",
+            "stream recovered after a decode-error line"
+        );
+        store.shutdown(); // reap the still-running "sleep 30" child
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn stream_recovers_after_over_cap_line() {
+        use crate::config::Config;
+        use std::time::{Duration, Instant};
+        // First invocation emits a line far over LINE_CAP (64 KiB) with no
+        // terminator, then goes quiet; the marker makes the respawned second
+        // invocation emit a normal valid line instead, so we can observe
+        // recovery (rather than an unbounded buffer / stuck reader).
+        let marker =
+            std::env::temp_dir().join(format!("pwetty-box-cap-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let cmd = format!(
+            "if [ -f {m} ]; then printf '{{\"value\":\"after-cap\"}}\\n'; sleep 30; \
+             else touch {m}; head -c 70000 /dev/zero | tr '\\0' 'A'; sleep 30; fi",
+            m = marker.display()
+        );
+        let store = super::from_config(&Config {
+            exec: Some(cmd),
+            stream: true,
+            format: Some("{{ value }}".into()),
+            font_size: 14.0,
+            ..Default::default()
+        })
+        .expect("exec source yields a store");
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while store.markup() != "after-cap" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            store.markup(),
+            "after-cap",
+            "valid line landed after an over-cap line"
+        );
+        store.shutdown(); // reap the still-running "sleep 30" child
+        let _ = std::fs::remove_file(&marker);
     }
 }
