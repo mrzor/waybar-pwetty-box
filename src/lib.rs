@@ -380,7 +380,7 @@ impl Module for PwettyBox {
                 if a > 0.01 {
                     let wl = area.allocated_width().max(1) as f64;
                     let hl = area.allocated_height().max(1) as f64;
-                    let (x, y, pw, ph, r) = focus_bubble(wl, hl);
+                    let (x, y, pw, ph, r) = focus_bubble(wl, hl, shared.config.corner_radius);
                     rounded_rect(cr, x, y, pw, ph, r);
                     set_hex(cr, HOVER_COLOR, a * HOVER_ALPHA);
                     cr.set_line_width(1.0);
