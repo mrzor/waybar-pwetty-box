@@ -1,0 +1,80 @@
+name: Release
+
+# A `v*` tag builds the waybar module (.so) plus the `pwetty` CLI for the two
+# architectures that run waybar in practice, and attaches them to a GitHub
+# release named after the tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build · ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          # Native runners, no cross-compiling the gtk -sys crates. 22.04
+          # rather than latest: the glibc floor (2.35) is what the .so demands
+          # of the host, so building on the older image keeps it loadable on
+          # older distros.
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same list as ci.yml / mise.toml.
+      - name: System build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-3-dev libepoxy-dev libegl-dev libgl-dev
+
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show
+
+      - run: cargo build --release --lib --bin pwetty
+
+      - name: Package
+        id: pkg
+        run: |
+          name="pwetty-box-${GITHUB_REF_NAME}-${{ matrix.arch }}-linux"
+          mkdir "$name"
+          cp target/release/libpwetty_box.so target/release/pwetty README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}.tar.gz*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # workflow_dispatch builds the artifacts only; publishing needs a tag.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
