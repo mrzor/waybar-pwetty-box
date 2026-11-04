@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::process::CommandExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -145,12 +146,7 @@ impl ContentStore {
         self.inner.shutdown.store(true, Ordering::Release);
         let pid = self.inner.child_pid.load(Ordering::Acquire);
         if pid != 0 {
-            // SIGTERM via the `kill` binary rather than adding a libc/nix
-            // dependency (neither is a direct dependency today) just to call
-            // kill(2) directly.
-            let _ = std::process::Command::new("kill")
-                .arg(pid.to_string())
-                .status();
+            kill_group(pid);
         }
     }
 
@@ -336,6 +332,7 @@ fn spawn_stream(cmd: String, publish: ContentStore, build: ContentBuilder) {
             .arg(&cmd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .process_group(0)
             .spawn()
         {
             Ok(mut child) => {
@@ -375,7 +372,7 @@ fn spawn_stream(cmd: String, publish: ContentStore, build: ContentBuilder) {
                 // is then a harmless no-op), but a decode-error/over-cap break
                 // leaves a live, possibly-quiet child that would otherwise
                 // gate `wait()` on its own next write.
-                let _ = child.kill();
+                kill_group(child.id());
                 let _ = child.wait();
                 publish.clear_child_pid();
             }
@@ -387,6 +384,17 @@ fn spawn_stream(cmd: String, publish: ContentStore, build: ContentBuilder) {
         // EOF / exit / spawn failure: keep last content, back off, respawn.
         thread::sleep(RESPAWN_BACKOFF);
     });
+}
+
+/// SIGTERM the stream child's whole process group (it leads its own via
+/// `process_group(0)`). Killing only the `sh -c` wrapper orphans the real
+/// producer, which then lingers until its next write hits EPIPE — forever for
+/// a quiet one. The `kill` binary avoids a libc/nix dependency for kill(2).
+fn kill_group(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", "--", &format!("-{pid}")])
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Run `cmd` via `sh -c` and return its trimmed stdout (empty on failure).
@@ -538,6 +546,55 @@ mod tests {
             assert_eq!(store.child_pid(), 0, "respawned after shutdown");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn shutdown_kills_grandchild_producer() {
+        use crate::config::Config;
+        use std::time::{Duration, Instant};
+        // `; true` stops sh from exec'ing `sleep`, so the producer is a
+        // grandchild behind the `sh -c` wrapper, like `claude-status tile-watch`.
+        let pidfile =
+            std::env::temp_dir().join(format!("pwetty-box-pgrp-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let store = super::from_config(&Config {
+            exec: Some(format!(
+                "printf 'x\\n'; sleep 300 & echo $! > {p}; wait; true",
+                p = pidfile.display()
+            )),
+            stream: true,
+            format: Some("{{ value }}".into()),
+            font_size: 14.0,
+            ..Default::default()
+        })
+        .expect("exec source yields a store");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut pid = String::new();
+        while pid.is_empty() && Instant::now() < deadline {
+            pid = std::fs::read_to_string(&pidfile)
+                .unwrap_or_default()
+                .trim()
+                .into();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pid.is_empty(), "grandchild started");
+
+        store.shutdown();
+
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_file(&pidfile);
+        assert!(!alive(), "grandchild producer killed on shutdown");
     }
 
     #[test]
