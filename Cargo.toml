@@ -1,6 +1,6 @@
 [package]
 name = "pwetty-box"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Waybar CFFI module that draws elaborate multiline text/icon tiles with GPU shaders (GtkGLArea + femtovg)"
