@@ -70,6 +70,26 @@ pub struct Config {
     /// parsed as a float (`true`/`false` → 1/0). Declare matching
     /// `uniform float <name>;` in the shader.
     pub shader_uniforms: Option<HashMap<String, String>>,
+
+    // --- drag-and-drop between tiles (see `lib.rs`) ---
+    /// Identity of this tile for drag-and-drop. When set, the tile can be
+    /// dragged onto any other tile of the same waybar that also sets one (and
+    /// receives their drops); the id travels as the drag payload.
+    #[serde(deserialize_with = "scalar_string")]
+    pub drag_id: Option<String>,
+    /// Shell command run on the tile a drag lands **on**, with `{src}` and
+    /// `{dst}` replaced by the dragged and the receiving tile's `drag_id`.
+    /// E.g. `"claude-status tile-move {src} {dst}"`.
+    pub on_drop: Option<String>,
+}
+
+/// Waybar hands the module a string value that looks like a number as that
+/// number (`"drag_id": "3"` arrives as `3`), so accept any scalar as a string.
+fn scalar_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<Value>::deserialize(d)?.map(|v| match v {
+        Value::String(s) => s,
+        other => other.to_string(),
+    }))
 }
 
 /// Deep-merge `over` into `base`: two objects merge key-by-key (recursively);
@@ -163,6 +183,8 @@ impl Default for Config {
             format: None,
             background_shader: None,
             shader_uniforms: None,
+            drag_id: None,
+            on_drop: None,
         }
     }
 }
@@ -238,6 +260,22 @@ mod tests {
         // Absent -> false (poll mode), the conservative default.
         let d: Config = serde_json::from_str(r#"{ "exec": "x" }"#).unwrap();
         assert!(!d.stream);
+    }
+
+    #[test]
+    fn drag_keys_parse_and_default_none() {
+        let c: Config =
+            serde_json::from_str(r#"{ "drag_id": "3", "on_drop": "mv {src} {dst}" }"#).unwrap();
+        assert_eq!(c.drag_id.as_deref(), Some("3"));
+        assert_eq!(c.on_drop.as_deref(), Some("mv {src} {dst}"));
+        assert!(Config::default().drag_id.is_none());
+        assert!(Config::default().on_drop.is_none());
+    }
+
+    #[test]
+    fn drag_id_accepts_the_number_waybar_turns_it_into() {
+        let c: Config = serde_json::from_str(r#"{ "drag_id": 3 }"#).unwrap();
+        assert_eq!(c.drag_id.as_deref(), Some("3"));
     }
 
     #[test]

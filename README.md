@@ -62,6 +62,8 @@ All keys live inside the `cffi/pwetty` block (parsed by `src/config.rs`):
 | `exec` | _(unset)_ | Shell command; its stdout is the tile's **data** (JSON if parseable, else plain text). |
 | `interval` | `0` | Re-run cadence for `exec`, in seconds (`0` = run once). Ignored when `stream` is set. |
 | `stream` | `false` | **Push mode** for `exec`: spawn the command **once** and treat each newline-delimited stdout line as fresh data (sub-150ms repaint), instead of polling on `interval`. The command stays alive and prints one JSON object per line whenever data changes; on EOF/exit the last content is kept and the command respawns after a ~1s backoff. Use for event-driven sources (e.g. a niri desktop-switch watcher) that need to update faster than a poll. |
+| `drag_id` | _(unset)_ | Makes the tile **draggable** onto any other tile of the same bar that also sets one (and a drop target for them); the id travels as the drag payload. |
+| `on_drop` | _(unset)_ | Shell command run on the tile a drag lands **on**, with `{src}`/`{dst}` replaced by the dragged and the receiving tile's `drag_id` — e.g. `"claude-status tile-move {src} {dst}"` to reorder niri desktops by dragging their tiles. |
 | `icon` | _(unset)_ | Glyph prepended to the content, sized + vertically centered on the text. |
 | `format` | `"{{ value }}"` | **Template** ([minijinja](https://github.com/mitsuhiko/minijinja)) rendered against the data → a Pango-markup string. See below. |
 | `font_size` | `14.0` | Base text size in pixels (per-span sizes via markup override it). |
