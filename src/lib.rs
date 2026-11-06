@@ -257,6 +257,72 @@ impl Module for PwettyBox {
             });
         }
 
+        // Drag-and-drop between tiles of the same bar: `drag_id` makes this
+        // tile a drag source (payload: its id) and a drop target; `on_drop`
+        // runs on the target with `{src}`/`{dst}` filled in. Same-app targets
+        // only, so nothing leaks to or from other windows.
+        if let Some(id) = config.drag_id.clone() {
+            let targets = [gtk::TargetEntry::new(
+                "application/x-pwetty-tile",
+                gtk::TargetFlags::SAME_APP,
+                0,
+            )];
+            area.drag_source_set(
+                gtk::gdk::ModifierType::BUTTON1_MASK,
+                &targets,
+                gtk::gdk::DragAction::MOVE,
+            );
+            // MOTION|DROP (not ALL): the hover ring is the drop highlight.
+            area.drag_dest_set(
+                gtk::DestDefaults::MOTION | gtk::DestDefaults::DROP,
+                &targets,
+                gtk::gdk::DragAction::MOVE,
+            );
+            {
+                let id = id.clone();
+                area.connect_drag_data_get(move |_, _, sel, _, _| {
+                    sel.set(&sel.target(), 8, id.as_bytes());
+                });
+            }
+            // Drag icon: the tile as it looks right now.
+            area.connect_drag_begin(|area, ctx| {
+                let (w, h) = (area.allocated_width(), area.allocated_height());
+                if let Ok(surf) =
+                    gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, w, h)
+                {
+                    if let Ok(cr) = gtk::cairo::Context::new(&surf) {
+                        area.draw(&cr);
+                    }
+                    ctx.drag_set_icon_surface(&surf);
+                }
+            });
+            {
+                let hover = hover.clone();
+                area.connect_drag_motion(move |area, _, _, _, _| {
+                    hover.set(true);
+                    animate_hover(area, &hover);
+                    false
+                });
+            }
+            {
+                let hover = hover.clone();
+                area.connect_drag_leave(move |area, _, _| {
+                    hover.set(false);
+                    animate_hover(area, &hover);
+                });
+            }
+            if let Some(cmd) = config.on_drop.clone() {
+                area.connect_drag_data_received(move |_, _, _, _, sel, _, _| {
+                    let src = String::from_utf8_lossy(&sel.data()).into_owned();
+                    if src.is_empty() || src == id {
+                        return;
+                    }
+                    let cmd = cmd.replace("{src}", &src).replace("{dst}", &id);
+                    std::thread::spawn(move || content::run_command(&cmd));
+                });
+            }
+        }
+
         // Content source (static text / refreshing command), if configured.
         let content = content::from_config(&config);
 

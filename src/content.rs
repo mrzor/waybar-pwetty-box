@@ -398,7 +398,7 @@ fn kill_group(pid: u32) {
 }
 
 /// Run `cmd` via `sh -c` and return its trimmed stdout (empty on failure).
-fn run_command(cmd: &str) -> String {
+pub(crate) fn run_command(cmd: &str) -> String {
     std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
